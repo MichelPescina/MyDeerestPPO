@@ -85,7 +85,7 @@ def make_env(gym_id, idx, capture_video, run_name):
             env = gym.make(gym_id, render_mode="rgb_array")
             env = gym.wrappers.RecordVideo(env, f"videos/{run_name}", episode_trigger=lambda x: x%50==0)
         else:
-            env = gym.make(gym_id, render_mode="none")
+            env = gym.make(gym_id, render_mode=None)
         return env
     return miau
 

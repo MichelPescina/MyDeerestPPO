@@ -1,18 +1,18 @@
 from MyDeerestPPO.PPOData import PPOData
-from MyDeerestPPO.PPOAgent import PPOAgent
+from MyDeerestPPO.PPORecAgent import PPORecAgent
 import torch
 import torch.nn as nn
 import numpy as np
 
-class PPO:
+class PPO_Recurrent:
     def __init__(
             self,
             gamma,
             epsilon,
-            mb_size,
+            mb_envs,
             optim,
             vloss_const = 0.5,
-            clip_gradients = False,
+            clip_gradients = True,
             max_grad_norm = 0.5,
             device = 'cpu'):
         """
@@ -26,7 +26,7 @@ class PPO:
         self.gamma = gamma
         self.epsilon = epsilon
         self.optim = optim
-        self.mb_size = mb_size
+        self.mb_envs = mb_envs
         self.optim = optim
         self.device = device
         self.clip_gradients = clip_gradients
@@ -36,7 +36,8 @@ class PPO:
 
     def learn(
             self,
-            agent: PPOAgent,
+            agent: PPORecAgent,
+            hiddens: torch.tensor,
             obs: PPOData,
             rewards: PPOData,
             actions: PPOData,
@@ -50,23 +51,22 @@ class PPO:
         # Check if all of the data has the same number of timesteps
         assert(len(resets) == obs.shape[0] == rewards.shape[0] == actions.shape[0] == logprobs.shape[0]), "Data doesn't have same number of timesteps"
         batch_size = len(resets)
-        assert batch_size % self.mb_size == 0, "Batch size not divisable by mini-batch size."
+        n_envs = obs.shape[1]
+        #assert batch_size % self.mb_envs == 0, "Number of envs not divisable by number of envs in mini-batch."
         # Info variables
         info = {'kl_div': []}
         # Starts here
         V_target = self._discounted_returns(agent, obs, rewards, resets)
-        indices = np.arange(batch_size)
-        np.random.shuffle(indices)
-        for mb_ind, start in enumerate(range(0, batch_size, self.mb_size)):
+        for mb_ind, start in enumerate(range(0, n_envs, self.mb_envs)):
             # Creating minibatches
-            end = start + self.mb_size
-            mb_indices = indices[start:end]
-            mb_obs = obs.get_minibatch(mb_indices).to(self.device)
-            mb_actions = actions.get_minibatch(mb_indices).to(self.device)
-            mb_logprobs = logprobs.get_minibatch(mb_indices).to(self.device)
-            mb_curr_logprobs = agent.actor_evaluate(mb_obs, mb_actions)
+            end = start + self.mb_envs
+            mb_hiddens = [h[:, start:end] for h in hiddens]
+            mb_obs = obs.data[:,start:end].to(self.device)
+            mb_actions = actions.data[:,start:end].to(self.device)
+            mb_logprobs = logprobs.data[:,start:end].to(self.device)
+            mb_curr_logprobs, _ = agent.actor_evaluate(mb_hiddens, mb_obs, mb_actions, resets)
             # Advantage estimate
-            mb_V_target = V_target[mb_indices]
+            mb_V_target = V_target[:,start:end]
             mb_curr_V = agent.critic_evaluate(mb_obs)
             adv_estim = mb_V_target - mb_curr_V
             # Clipped surrogate loss
@@ -92,7 +92,7 @@ class PPO:
         return info
 
 
-    def _discounted_returns(self, agent:PPOAgent, obs: PPOData, rewards: PPOData, resets: list[bool]):
+    def _discounted_returns(self, agent:PPORecAgent, obs: PPOData, rewards: PPOData, resets: list[bool]):
         with torch.no_grad():
             timesteps = len(resets)
             discounted_returns = torch.zeros(rewards.shape, dtype=rewards.dtype).to(self.device)

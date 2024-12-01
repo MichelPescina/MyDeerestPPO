@@ -1,131 +1,41 @@
+# System
+import pathlib
+import time
 import datetime
 import argparse
-import gymnasium as gym
-import numpy as np
-import MyDeerestPPO as Deer
-import torch
-import torch.nn as nn
-from torch.distributions.multivariate_normal import MultivariateNormal
-
 import traceback
+# Venv Packages
+import gymnasium as gym
+import FigFollowerEnv
+import numpy as np
+import torch
+# Local
+import MyDeerestPPO as Deer
+from RAgent import RAgent
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
-def layer_init(layer, std=np.sqrt(2), bias_const=0.0):
-    torch.nn.init.orthogonal_(layer.weight, std)
-    torch.nn.init.constant_(layer.bias, bias_const)
-    return layer
+def get_reward_performance(infos):
+    performance = (infos['accum_reward'] / infos['max_reward']).mean()
+    return performance
 
-class DWSConv2d(nn.Module):
-    def __init__(self, in_channels, out_channels, kernel_size, activation, layer_init = None):
-        super(DWSConv2d, self).__init__()
-        if type(layer_init) != type(None):
-            self.depth = layer_init(nn.Conv2d(
-                in_channels = in_channels,
-                out_channels = in_channels,
-                kernel_size = kernel_size,
-                groups = in_channels,
-                padding = 'same'
-            ))
-            self.point = layer_init(nn.Conv2d(
-                in_channels = in_channels,
-                out_channels = out_channels,
-                kernel_size = 1,
-            ))
-        else:
-            self.depth = nn.Conv2d(
-                in_channels = in_channels,
-                out_channels = in_channels,
-                kernel_size = kernel_size,
-                groups = in_channels,
-                padding = 'same'
-            )
-            self.point = nn.Conv2d(
-                in_channels = in_channels,
-                out_channels = out_channels,
-                kernel_size = 1,
-            )
-        self.activ = activation
-
-    def forward(self, x):
-        x = self.activ(self.depth(x))
-        x = self.activ(self.point(x))
-        return x
-
-
-class Agent(nn.Module, Deer.PPOAgent):
-    def __init__(self, inputs: int, outputs: int, std_dev = 0.5, device = 'cpu'):
-        super().__init__()
-        self.device = device
-        self.n_actions = outputs
-        self.change_exploration_rate(std_dev)
-        self.actor_model = nn.Sequential(
-            layer_init(nn.Linear(inputs, 32)),
-            nn.Tanh(),
-            layer_init(nn.Linear(32, 16)),
-            nn.Tanh(),
-            layer_init(nn.Linear(16, outputs), 0.01),
-            nn.Tanh()
-        )
-        self.critic_model = nn.Sequential(
-            layer_init(nn.Linear(inputs, 32)),
-            nn.Tanh(),
-            layer_init(nn.Linear(32, 16)),
-            nn.Tanh(),
-            layer_init(nn.Linear(16, 1), 1.0),
-            nn.Tanh()
-        )
-    
-
-    def change_exploration_rate(self, std_dev):
-        self.std_dev = std_dev
-        cov_var = torch.full(size=(self.n_actions,), fill_value=self.std_dev).to(self.device)
-        self.cov_mat = torch.diag(cov_var)
-
-    
-    def actor(self, obs):
-        means = self.actor_model(obs)
-        actions = means
-        distribution = MultivariateNormal(means, self.cov_mat)
-        if self.training:
-            actions = distribution.sample()
-        logprob = distribution.log_prob(actions)
-        return actions, logprob
-    
-
-    def critic(self, obs):
-        return self.critic_model(obs)
-
-    
-    def actor_evaluate(self, obs, actions):
-        n_steps = obs.shape[0]
-        n_envs = obs.shape[1]
-        obs.reshape((-1,) + obs.shape[2:])
-        means = self.actor_model(obs)
-        distribution = MultivariateNormal(means, self.cov_mat)
-        logprob = distribution.log_prob(actions)
-        return logprob.reshape((n_steps, n_envs,))
-    
-
-    def critic_evaluate(self, obs):
-        n_steps = obs.shape[0]
-        n_envs = obs.shape[1]
-        obs.reshape((-1,) + obs.shape[2:])
-        values = self.critic_model(obs)
-        return values.reshape((n_steps, n_envs))
-    
 
 def make_env(gym_id, idx, capture_video, run_name):
     def miau():
         if capture_video and idx == 0:
-            env = gym.make(gym_id, render_mode="rgb_array")
-            env = gym.wrappers.RecordVideo(env, f"videos/{run_name}", episode_trigger=lambda x: x%50==0)
+            env = gym.make(gym_id, render_mode="rgb_array", fps=10, nodes = 6, max_time = 60)
+            env = gym.wrappers.RecordVideo(env, f"videos/{run_name}", episode_trigger=lambda x: x%10==0)
         else:
-            env = gym.make(gym_id, render_mode="none")
+            env = gym.make(gym_id, render_mode=None, fps=10, nodes = 6, max_time = 60)
         return env
     return miau
 
-        
+
+def to_tensor(obs):
+    tensor = torch.from_numpy(obs).to(DEVICE)
+    tensor = tensor.float() / 255
+    return tensor.permute(0, 3, 1, 2)
+
 
 def parse_args():
     parser = argparse.ArgumentParser()
@@ -151,45 +61,63 @@ if __name__ == "__main__":
     batch_size = args.b_size
     mb_size = args.mb_size
     total_timesteps = args.steps
-    gym_id = 'Pendulum-v1'
+    gym_id = 'FigFollowerEnv-v1'
     now = datetime.datetime.now()
     run_name = f'{gym_id}_{now.year}{now.month}{now.day}_{now.hour}{now.minute}'
-    # Counters
+    # Counters and variables
     steps = 0
+    performance = 0
+    last_save = 0
+    save_period = 2500
+    TRAINING = pathlib.Path('Training/' + run_name + '/')
+    TRAINING.mkdir(parents=True, exist_ok=True)
     # Creating parts of the algorithm
     envs = gym.vector.SyncVectorEnv(
         [make_env(gym_id, i, args.video, run_name) for i in range(n_envs)]
     )
-    agent = Agent(envs.single_observation_space.shape[0], envs.single_action_space.shape[0], 0.1, device=DEVICE).to(DEVICE)
+    agent = RAgent(envs.single_action_space.shape[0], 0.1, device=DEVICE).to(DEVICE)
     optim = torch.optim.Adam(agent.parameters(), 0.001)
-    ppo = Deer.PPO(0.99, 0.2, mb_size, optim, device = DEVICE, vloss_const=1.0)
+    ppo = Deer.PPO_Recurrent(0.99, 0.2, mb_size, optim, device = DEVICE, vloss_const=1.0, clip_gradients=True)
     # Creating batches
-    batch_observations = Deer.PPOData(n_envs, batch_size, list(envs.single_observation_space.shape), device=DEVICE)
+    batch_observations = Deer.PPOData(n_envs, batch_size, [3, 240, 320], device=DEVICE)
     batch_actions = Deer.PPOData(n_envs, batch_size, list(envs.single_action_space.shape), device=DEVICE)
     batch_logprobs = Deer.PPOData(n_envs, batch_size, device=DEVICE)
     batch_rewards = Deer.PPOData(n_envs, batch_size, device=DEVICE)
     batch_resets = [False] * batch_size
     try:
         next_obs, infos = envs.reset()
+        hiddens = [
+            torch.zeros((1, n_envs, 128)).to(DEVICE),
+            torch.zeros((1, n_envs, 4)).to(DEVICE),
+        ]
+        print(hiddens[0].shape)
         while steps < total_timesteps:
             # Data collection phase
             with torch.no_grad():
+                start_hiddens = [h.clone() for h in hiddens]
                 for t in range(batch_size):
                     obs = next_obs
-                    actions, logprobs = agent.actor(torch.from_numpy(obs).to(DEVICE))
-                    next_obs, rewards, terminations, truncations, infos = envs.step((actions*2).cpu().numpy())
+                    input = to_tensor(obs)
+                    actions, logprobs, hiddens = agent.actor(hiddens, input)
+                    next_obs, rewards, terminations, truncations, infos = envs.step(actions.squeeze().cpu().numpy())
                     ended = np.any(terminations) or np.any(truncations)
-                    batch_observations.update(torch.from_numpy(obs).to(DEVICE), t)
+                    batch_observations.update(input, t)
                     batch_actions.update(actions, t)
                     batch_logprobs.update(logprobs, t)
                     batch_rewards.update(torch.from_numpy(rewards).to(DEVICE), t)
                     if ended:
                         next_obs, infos = envs.reset()
                         batch_resets[t] = True
+                        hiddens = [
+                            torch.zeros((1, n_envs, 128)).to(DEVICE),
+                            torch.zeros((1, n_envs, 4)).to(DEVICE),
+                        ]
             # Learning Phase
             steps += batch_size
+            performance = get_reward_performance(infos)
             info = ppo.learn(
                 agent,
+                start_hiddens,
                 batch_observations,
                 batch_rewards,
                 batch_actions,
@@ -198,7 +126,12 @@ if __name__ == "__main__":
                 )
             print(f"Timesteps: {steps} Average Batch Reward: {batch_rewards.data.mean()}")
             print(f"Approx KL Divergence: {info['kl_div']}")
+            print(f"Reward performance: {performance}")
+            if steps >= last_save + save_period:
+                last_save = steps
+                torch.save(agent.state_dict(), str(TRAINING) + f'/Agent_{steps}.pt')
     except Exception as e:
         envs.close()
         print(traceback.format_exc())
+    torch.save(agent.state_dict(), str(TRAINING) + f'/Agent_{steps}.pt')
     envs.close()
